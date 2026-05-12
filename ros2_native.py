@@ -52,6 +52,11 @@ def _make_transform(spawn_point):
     )
 
 
+def load_config_file(path):
+    with open(path, encoding="utf-8") as file_obj:
+        return json.load(file_obj)
+
+
 def _resolve_vehicle_spawn_point(map_, config):
     # New config key:
     # - "spawn_point": explicit world transform for the vehicle.
@@ -154,6 +159,27 @@ def _load_objects(config):
     return [config]
 
 
+def spawn_actors_from_config(world, config):
+    vehicles = []
+    sensors = []
+
+    objects = _load_objects(config)
+    for vehicle_config in objects:
+        vehicle = _setup_vehicle(world, vehicle_config)
+        vehicles.append(vehicle)
+        sensors.extend(_setup_sensors(world, vehicle, vehicle_config))
+
+    return vehicles, sensors, objects
+
+
+def destroy_actors(sensors, vehicles):
+    for sensor in reversed(sensors):
+        sensor.destroy()
+
+    for vehicle in reversed(vehicles):
+        vehicle.destroy()
+
+
 def _set_vehicle_autopilot(vehicle, enabled, traffic_manager):
     if not enabled:
         return
@@ -187,14 +213,8 @@ def main(args):
         traffic_manager = client.get_trafficmanager(args.tm_port)
         traffic_manager.set_synchronous_mode(True)
 
-        with open(args.file, encoding="utf-8") as f:
-            config = json.load(f)
-
-        objects = _load_objects(config)
-        for vehicle_config in objects:
-            vehicle = _setup_vehicle(world, vehicle_config)
-            vehicles.append(vehicle)
-            sensors.extend(_setup_sensors(world, vehicle, vehicle_config))
+        config = load_config_file(args.file)
+        vehicles, sensors, objects = spawn_actors_from_config(world, config)
 
         _ = world.tick()
 
@@ -221,11 +241,7 @@ def main(args):
         if world is not None and original_settings is not None:
             world.apply_settings(original_settings)
 
-        for sensor in reversed(sensors):
-            sensor.destroy()
-
-        for vehicle in reversed(vehicles):
-            vehicle.destroy()
+        destroy_actors(sensors, vehicles)
 
 
 if __name__ == "__main__":

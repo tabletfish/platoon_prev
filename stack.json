@@ -1,111 +1,29 @@
 {
   "_comment": [
-    "Based on CARLA ue5-dev ros2 example stack.json, expanded for 4 vehicles.",
-    "New top-level key: objects",
-    "New per-vehicle keys: spawn_point_index, autopilot",
-    "Existing keys still used: type, id, sensors"
+    "Single-ego baseline stack for native ROS2 scenarios.",
+    "Scenario-specific spawn points are overridden by scenario_town03.json or episode.py."
   ],
   "objects": [
     {
-      "_comment": "Vehicle 1. spawn_point_index selects CARLA map spawn point 0.",
       "type": "vehicle.lincoln.mkz_2017",
-      "id": "hero_1",
+      "id": "hero",
       "spawn_point_index": 0,
       "autopilot": false,
       "sensors": [
         {
-          "_comment": "Sensor ids may repeat because ros2_native.py now prefixes them with vehicle id.",
           "type": "sensor.camera.rgb",
-          "id": "rgb",
+          "id": "rgb_front",
           "spawn_point": {
-            "x": -4.5,
+            "x": 1.5,
             "y": 0.0,
-            "z": 2.5,
+            "z": 2.4,
             "roll": 0.0,
-            "pitch": 20.0,
+            "pitch": 0.0,
             "yaw": 0.0
           },
           "attributes": {
-            "image_size_x": 400,
-            "image_size_y": 200,
-            "fov": 90.0
-          }
-        }
-      ]
-    },
-    {
-      "_comment": "Vehicle 2. Uses a different blueprint and spawn point.",
-      "type": "vehicle.tesla.model3",
-      "id": "hero_2",
-      "spawn_point_index": 1,
-      "autopilot": false,
-      "sensors": [
-        {
-          "type": "sensor.camera.rgb",
-          "id": "rgb",
-          "spawn_point": {
-            "x": -4.5,
-            "y": 0.0,
-            "z": 2.5,
-            "roll": 0.0,
-            "pitch": 20.0,
-            "yaw": 0.0
-          },
-          "attributes": {
-            "image_size_x": 400,
-            "image_size_y": 200,
-            "fov": 90.0
-          }
-        }
-      ]
-    },
-    {
-      "_comment": "Vehicle 3.",
-      "type": "vehicle.audi.tt",
-      "id": "hero_3",
-      "spawn_point_index": 2,
-      "autopilot": false,
-      "sensors": [
-        {
-          "type": "sensor.camera.rgb",
-          "id": "rgb",
-          "spawn_point": {
-            "x": -4.5,
-            "y": 0.0,
-            "z": 2.5,
-            "roll": 0.0,
-            "pitch": 20.0,
-            "yaw": 0.0
-          },
-          "attributes": {
-            "image_size_x": 400,
-            "image_size_y": 200,
-            "fov": 90.0
-          }
-        }
-      ]
-    },
-    {
-      "_comment": "Vehicle 4.",
-      "type": "vehicle.mini.cooper_s",
-      "id": "hero_4",
-      "spawn_point_index": 3,
-      "autopilot": false,
-      "sensors": [
-        {
-          "type": "sensor.camera.rgb",
-          "id": "rgb",
-          "spawn_point": {
-            "x": -4.5,
-            "y": 0.0,
-            "z": 2.5,
-            "roll": 0.0,
-            "pitch": 20.0,
-            "yaw": 0.0
-          },
-          "attributes": {
-            "image_size_x": 400,
-            "image_size_y": 200,
+            "image_size_x": 800,
+            "image_size_y": 600,
             "fov": 90.0
           }
         }

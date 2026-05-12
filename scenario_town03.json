@@ -1,0 +1,68 @@
+{
+  "_comment": [
+    "Town03_Opt single-ego episode scenario.",
+    "Town03 crashes this CARLA build, so use Town03_Opt for the same road layout.",
+    "The route points below are placeholders. Use `python3.10 episode.py --print-spawn-points`",
+    "to inspect Town03_Opt spawn indexes and replace them with points that pass through the tunnel."
+  ],
+  "map": "Town03_Opt",
+  "allow_map_load": true,
+  "stack_file": "stack.json",
+  "episode": {
+    "mode": "infinite",
+    "max_time_sec": 90.0,
+    "respawn_delay_sec": 0.25,
+    "settle_time_sec": 1.5
+  },
+  "autopilot": true,
+  "behavior": {
+    "speed_percentage_difference": 45.0
+  },
+  "termination": {
+    "goal_tolerance_m": 5.0,
+    "stuck_speed_mps": 0.5,
+    "stuck_time_sec": 8.0,
+    "stuck_grace_sec": 12.0,
+    "collision": true
+  },
+  "spectator": {
+    "enabled": true,
+    "distance": 7.5,
+    "height": 3.0,
+    "lateral_offset": 0.0,
+    "pitch": -14.0
+  },
+  "ego": {
+    "spawn_point": {
+      "x": 145.0,
+      "y": -195.2,
+      "z": 0.5,
+      "roll": 0.0,
+      "pitch": 0.0,
+      "yaw": -1.05
+    },
+    "route_points": [
+      {
+        "location": {
+          "x": 153.8,
+          "y": -195.2,
+          "z": 0.5
+        }
+      },
+      {
+        "location": {
+          "x": 195.7,
+          "y": -161.7,
+          "z": 0.5
+        }
+      },
+      {
+        "location": {
+          "x": 237.6,
+          "y": -128.2,
+          "z": 0.5
+        }
+      }
+    ]
+  }
+}
