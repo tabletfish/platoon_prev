@@ -26,7 +26,7 @@ cd ~/carla_0.9.16
 
 ```bash
 cd ~/종합설계/label_file
-python3.10 episode.py
+python3 episode.py
 ```
 
 `episode.py` will connect to CARLA on `localhost:2000`, switch the map to `Town03_Opt`, spawn the ego vehicle, and repeat episodes.
