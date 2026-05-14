@@ -43,19 +43,19 @@ python3.10 -c "import carla; c=carla.Client('localhost',2000); c.set_timeout(5.0
 Run a single episode:
 
 ```bash
-python3.10 episode.py --once
+python3 episode.py 
 ```
 
 Print spawn points for the current scenario map:
 
 ```bash
-python3.10 episode.py --print-spawn-points
+python3 episode.py --print-spawn-points
 ```
 
 Run the lower-level native stack only:
 
 ```bash
-python3.10 ros2_native.py -f stack.json
+python3 ros2_native.py -f stack.json
 ```
 
 ## Notes
