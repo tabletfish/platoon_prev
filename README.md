@@ -27,6 +27,13 @@ cd ~/carla_0.9.16
 ```bash
 cd ~/종합설계/label_file
 python3 episode.py
+
+```
+
+3. 위치 추출:
+
+```bash
+python3.10 -c "import carla; c=carla.Client('localhost',2000); c.set_timeout(5.0); w=c.get_world(); t=w.get_spectator().get_transform(); print(f'x={t.location.x:.2f}, y={t.location.y:.2f}, z={t.location.z:.2f}, roll={t.rotation.roll:.2f}, pitch={t.rotation.pitch:.2f}, yaw={t.rotation.yaw:.2f}')"
 ```
 
 `episode.py` will connect to CARLA on `localhost:2000`, switch the map to `Town03_Opt`, spawn the ego vehicle, and repeat episodes.
