@@ -392,6 +392,31 @@ def _tick_for_seconds(world, duration_sec):
         world.tick()
 
 
+def _create_tick_guard(world):
+    snapshot = world.get_snapshot()
+    return {"last_frame": snapshot.frame if snapshot is not None else None}
+
+
+def _tick_world_single_owner(world, tick_guard):
+    frame = world.tick()
+    last_frame = tick_guard["last_frame"]
+    if last_frame is not None and frame != last_frame + 1:
+        raise RuntimeError(
+            "Detected external CARLA ticks while episode.py was running. "
+            f"Expected frame {last_frame + 1}, but received {frame}. "
+            "Another process is likely calling world.tick() on the same world."
+        )
+    tick_guard["last_frame"] = frame
+    return frame
+
+
+def _tick_for_seconds_single_owner(world, duration_sec, tick_guard):
+    dt = float(world.get_settings().fixed_delta_seconds or 0.05)
+    steps = max(1, int(round(duration_sec / dt)))
+    for _ in range(steps):
+        _tick_world_single_owner(world, tick_guard)
+
+
 def _configure_traffic_lights(world, scenario_config):
     traffic_light_config = scenario_config.get("traffic_lights", {})
     if not bool(traffic_light_config.get("force_green", False)):
@@ -762,6 +787,7 @@ def main(args):
         max_time_sec = float(scenario_config.get("episode", {}).get("max_time_sec", 90.0))
         respawn_delay_sec = float(scenario_config.get("episode", {}).get("respawn_delay_sec", 2.0))
         dt = float(world.get_settings().fixed_delta_seconds or 0.05)
+        tick_guard = _create_tick_guard(world)
         spectator_config = scenario_config.get("spectator", {})
 
         episode_count = 0
@@ -788,9 +814,13 @@ def main(args):
                     sensors.append(collision_sensor)
                     collision_states[actor_id] = collision_state
 
-                _ = world.tick()
+                _ = _tick_world_single_owner(world, tick_guard)
 
-                _tick_for_seconds(world, float(scenario_config.get("episode", {}).get("settle_time_sec", 1.0)))
+                _tick_for_seconds_single_owner(
+                    world,
+                    float(scenario_config.get("episode", {}).get("settle_time_sec", 1.0)),
+                    tick_guard,
+                )
                 leader_agent = _build_basic_agent(
                     leader_vehicle,
                     map_,
@@ -831,7 +861,7 @@ def main(args):
                 termination = scenario_config.get("termination", {})
 
                 while True:
-                    _ = world.tick()
+                    _ = _tick_world_single_owner(world, tick_guard)
                     elapsed_sec += dt
                     tick_count += 1
                     timers["elapsed_sec"] = elapsed_sec
@@ -880,7 +910,7 @@ def main(args):
             if args.once:
                 break
 
-            _tick_for_seconds(world, respawn_delay_sec)
+            _tick_for_seconds_single_owner(world, respawn_delay_sec, tick_guard)
 
     except KeyboardInterrupt:
         print("\nCancelled by user. Bye!")

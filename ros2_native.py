@@ -283,6 +283,24 @@ def _set_vehicle_autopilot(vehicle, enabled, traffic_manager):
         vehicle.set_autopilot(True)
 
 
+def _create_tick_guard(world):
+    snapshot = world.get_snapshot()
+    return {"last_frame": snapshot.frame if snapshot is not None else None}
+
+
+def _tick_world_single_owner(world, tick_guard):
+    frame = world.tick()
+    last_frame = tick_guard["last_frame"]
+    if last_frame is not None and frame != last_frame + 1:
+        raise RuntimeError(
+            "Detected external CARLA ticks while ros2_native.py was running. "
+            f"Expected frame {last_frame + 1}, but received {frame}. "
+            "Another process is likely calling world.tick() on the same world."
+        )
+    tick_guard["last_frame"] = frame
+    return frame
+
+
 def main(args):
     world = None
     original_settings = None
@@ -300,6 +318,7 @@ def main(args):
         settings.synchronous_mode = True
         settings.fixed_delta_seconds = 0.05
         world.apply_settings(settings)
+        tick_guard = _create_tick_guard(world)
 
         traffic_manager = client.get_trafficmanager(args.tm_port)
         traffic_manager.set_synchronous_mode(True)
@@ -307,13 +326,14 @@ def main(args):
         config = load_config_file(args.file)
         vehicles, sensors, objects = spawn_actors_from_config(world, config)
 
-        _ = world.tick()
+        _ = _tick_world_single_owner(world, tick_guard)
 
         for vehicle, vehicle_config in zip(vehicles, objects):
             autopilot_enabled = bool(vehicle_config.get("autopilot", True))
             _set_vehicle_autopilot(vehicle, autopilot_enabled, traffic_manager)
 
         logging.info("Running with %d vehicle(s)...", len(vehicles))
+        logging.info("This process owns CARLA ticks. Do not run ros2_native.py together with episode.py.")
         for vehicle in vehicles:
             logging.info(
                 "Spawned vehicle id=%s role_name=%s type=%s",
@@ -323,7 +343,7 @@ def main(args):
             )
 
         while True:
-            _ = world.tick()
+            _ = _tick_world_single_owner(world, tick_guard)
 
     except KeyboardInterrupt:
         print("\nCancelled by user. Bye!")

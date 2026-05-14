@@ -6,6 +6,7 @@ This directory contains a single-ego CARLA native ROS2 setup built around:
 - `episode.py`: repeated episode runner
 - `stack.json`: ego vehicle and sensor stack
 - `scenario_town03.json`: map and episode configuration
+- `references/scenario_main.py`: external reference script kept separately from the runnable stack
 
 ## Prerequisites
 
@@ -26,7 +27,7 @@ cd ~/carla_0.9.16
 
 ```bash
 cd ~/종합설계/label_file
-python3 episode.py
+python3.10 episode.py
 
 ```
 
@@ -57,6 +58,9 @@ Run the lower-level native stack only:
 ```bash
 python3 ros2_native.py -f stack.json
 ```
+
+Do not run `ros2_native.py` at the same time as `episode.py`.
+`episode.py` already spawns the vehicles and sensors and owns the CARLA tick loop.
 
 ## Notes
 
