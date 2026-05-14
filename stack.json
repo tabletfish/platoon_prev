@@ -1,12 +1,13 @@
 {
   "_comment": [
-    "Single-ego baseline stack for native ROS2 scenarios.",
+    "Two-vehicle baseline stack for native ROS2 scenarios.",
     "Scenario-specific spawn points are overridden by scenario_town03.json or episode.py."
   ],
   "objects": [
     {
       "type": "vehicle.lincoln.mkz_2017",
-      "id": "hero",
+      "id": "leader",
+      "clear_spawn_radius_m": 12.0,
       "spawn_point_index": 0,
       "autopilot": false,
       "sensors": [
@@ -28,6 +29,14 @@
           }
         }
       ]
+    },
+    {
+      "type": "vehicle.lincoln.mkz_2017",
+      "id": "follower",
+      "clear_spawn_radius_m": 0.0,
+      "spawn_point_index": 0,
+      "autopilot": false,
+      "sensors": []
     }
   ]
 }

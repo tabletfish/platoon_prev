@@ -4,6 +4,9 @@ import argparse
 import copy
 import logging
 import math
+import os
+import random
+import sys
 import time
 from pathlib import Path
 
@@ -11,7 +14,6 @@ import carla
 
 from ros2_native import (
     _make_transform,
-    _set_vehicle_autopilot,
     destroy_actors,
     load_config_file,
     spawn_actors_from_config,
@@ -19,6 +21,38 @@ from ros2_native import (
 
 
 DEFAULT_SCENARIO_FILE = Path(__file__).with_name("scenario_town03.json")
+
+
+def _load_basic_agent():
+    try:
+        from agents.navigation.basic_agent import BasicAgent
+        return BasicAgent
+    except ModuleNotFoundError:
+        candidate_roots = []
+
+        carla_root = os.environ.get("CARLA_ROOT")
+        if carla_root:
+            candidate_roots.append(Path(carla_root) / "PythonAPI" / "carla")
+
+        candidate_roots.append(Path.home() / "carla_0.9.16" / "PythonAPI" / "carla")
+
+        for candidate in candidate_roots:
+            candidate_str = str(candidate)
+            if candidate.exists() and candidate_str not in sys.path:
+                sys.path.append(candidate_str)
+                try:
+                    from agents.navigation.basic_agent import BasicAgent
+                    return BasicAgent
+                except ModuleNotFoundError:
+                    continue
+
+    raise SystemExit(
+        "Failed to import CARLA BasicAgent.\n"
+        "Set CARLA_ROOT or install CARLA PythonAPI agents on the Python path."
+    )
+
+
+BasicAgent = _load_basic_agent()
 
 
 def _distance_between(a, b):
@@ -60,32 +94,141 @@ def _resolve_route_location(map_, point_config):
     raise ValueError("Each route point must define location, spawn_point, or spawn_point_index.")
 
 
-def _make_location(location_config):
-    return carla.Location(
-        x=location_config["x"],
-        y=location_config["y"],
-        z=location_config.get("z", 0.0),
+def _get_actor_scenario_config(scenario_config, actor_id):
+    return scenario_config.get(actor_id, {})
+
+
+def _find_object_config(stack_config, actor_id):
+    for object_config in stack_config.get("objects", []):
+        if object_config.get("id") == actor_id:
+            return object_config
+    raise ValueError(f'stack.json must define an object with id="{actor_id}".')
+
+
+def _resolve_actor_route_locations(map_, actor_config):
+    route_locations = [
+        _resolve_route_location(map_, point_config)
+        for point_config in actor_config.get("route_points", [])
+    ]
+
+    if "destination" in actor_config:
+        route_locations.append(_resolve_route_location(map_, actor_config["destination"]))
+
+    return route_locations
+
+
+def _project_to_driving_location(map_, location):
+    waypoint = map_.get_waypoint(
+        location,
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving,
     )
+    return waypoint.transform.location, waypoint
+
+
+def _project_spawn_transform(map_, spawn_config):
+    requested_transform = _make_transform(spawn_config)
+    projected_location, waypoint = _project_to_driving_location(map_, requested_transform.location)
+    rotation = waypoint.transform.rotation
+    rotation.roll = requested_transform.rotation.roll
+
+    return carla.Transform(projected_location, rotation)
+
+
+def _project_destination_location(map_, destination_config):
+    destination_location = _resolve_route_location(map_, destination_config)
+    projected_location, _ = _project_to_driving_location(map_, destination_location)
+    return projected_location
 
 
 def _apply_scenario_to_stack(stack_config, scenario_config):
     config = copy.deepcopy(stack_config)
-    objects = config.get("objects", [])
-    if len(objects) != 1:
-        raise ValueError("This episode runner currently expects exactly one ego vehicle in stack.json.")
+    for actor_id in ("leader", "follower"):
+        actor_stack_config = _find_object_config(config, actor_id)
+        actor_scenario_config = _get_actor_scenario_config(scenario_config, actor_id)
 
-    ego_config = objects[0]
-    scenario_ego = scenario_config.get("ego", {})
+        if "spawn_point" in actor_scenario_config:
+            actor_stack_config["spawn_point"] = actor_scenario_config["spawn_point"]
+            actor_stack_config.pop("spawn_point_index", None)
+        elif "spawn_point_index" in actor_scenario_config:
+            actor_stack_config["spawn_point_index"] = int(actor_scenario_config["spawn_point_index"])
+            actor_stack_config.pop("spawn_point", None)
 
-    if "spawn_point" in scenario_ego:
-        ego_config["spawn_point"] = scenario_ego["spawn_point"]
-        ego_config.pop("spawn_point_index", None)
-    elif "spawn_point_index" in scenario_ego:
-        ego_config["spawn_point_index"] = int(scenario_ego["spawn_point_index"])
-        ego_config.pop("spawn_point", None)
+        actor_stack_config["autopilot"] = bool(actor_scenario_config.get("autopilot", False))
 
-    ego_config["autopilot"] = bool(scenario_config.get("autopilot", ego_config.get("autopilot", False)))
     return config
+
+
+def _project_location_list(map_, route_locations):
+    return [
+        _project_destination_location(map_, {"location": {"x": location.x, "y": location.y, "z": location.z}})
+        for location in route_locations
+    ]
+
+
+def _project_follower_spawn_from_leader(map_, leader_transform, follower_config):
+    gap_m = float(follower_config.get("spawn_gap_m", 12.0))
+    waypoint = map_.get_waypoint(
+        leader_transform.location,
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving,
+    )
+    if waypoint is None:
+        raise RuntimeError("Could not project leader spawn to a driving waypoint for follower placement.")
+
+    previous_waypoints = waypoint.previous(gap_m)
+    follower_waypoint = previous_waypoints[0] if previous_waypoints else waypoint
+    transform = follower_waypoint.transform
+    transform.location.z += 0.05
+    return transform
+
+
+def _align_scenario_to_map(stack_config, scenario_config, map_):
+    config = copy.deepcopy(stack_config)
+    leader_stack_config = _find_object_config(config, "leader")
+    follower_stack_config = _find_object_config(config, "follower")
+
+    projected_leader_spawn = _project_spawn_transform(map_, leader_stack_config["spawn_point"])
+    leader_stack_config["spawn_point"] = {
+        "x": projected_leader_spawn.location.x,
+        "y": projected_leader_spawn.location.y,
+        "z": projected_leader_spawn.location.z + 0.05,
+        "roll": projected_leader_spawn.rotation.roll,
+        "pitch": projected_leader_spawn.rotation.pitch,
+        "yaw": projected_leader_spawn.rotation.yaw,
+    }
+
+    follower_scenario_config = _get_actor_scenario_config(scenario_config, "follower")
+    if "spawn_point" in follower_stack_config:
+        projected_follower_spawn = _project_spawn_transform(map_, follower_stack_config["spawn_point"])
+    else:
+        projected_follower_spawn = _project_follower_spawn_from_leader(
+            map_,
+            projected_leader_spawn,
+            follower_scenario_config,
+        )
+    follower_stack_config["spawn_point"] = {
+        "x": projected_follower_spawn.location.x,
+        "y": projected_follower_spawn.location.y,
+        "z": projected_follower_spawn.location.z + 0.05,
+        "roll": projected_follower_spawn.rotation.roll,
+        "pitch": projected_follower_spawn.rotation.pitch,
+        "yaw": projected_follower_spawn.rotation.yaw,
+    }
+    follower_stack_config.pop("spawn_point_index", None)
+
+    leader_route_locations = _project_location_list(
+        map_,
+        _resolve_actor_route_locations(map_, _get_actor_scenario_config(scenario_config, "leader")),
+    )
+    follower_route_config = _get_actor_scenario_config(scenario_config, "follower")
+    follower_route_locations = _resolve_actor_route_locations(map_, follower_route_config)
+    if not follower_route_locations:
+        follower_route_locations = list(leader_route_locations)
+    else:
+        follower_route_locations = _project_location_list(map_, follower_route_locations)
+
+    return config, {"leader": leader_route_locations, "follower": follower_route_locations}
 
 
 def _setup_world(client, map_name, tm_port, allow_map_load, map_load_requested):
@@ -197,21 +340,38 @@ def _attach_collision_sensor(world, vehicle):
     return sensor, state
 
 
-def _update_spectator(world, vehicle, camera_config):
+def _update_spectator(world, vehicles, camera_config):
     if not camera_config.get("enabled", False):
         return
 
-    vehicle_transform = vehicle.get_transform()
-    forward = vehicle_transform.get_forward_vector()
-    up = vehicle_transform.get_up_vector()
-    right = vehicle_transform.get_right_vector()
+    if not vehicles:
+        return
+
+    lead_vehicle = vehicles[0]
+    lead_transform = lead_vehicle.get_transform()
+    forward = lead_transform.get_forward_vector()
+    up = lead_transform.get_up_vector()
+    right = lead_transform.get_right_vector()
 
     distance = float(camera_config.get("distance", 8.0))
     height = float(camera_config.get("height", 3.5))
     lateral_offset = float(camera_config.get("lateral_offset", 0.0))
     pitch = float(camera_config.get("pitch", -15.0))
+    yaw = lead_transform.rotation.yaw
 
-    location = vehicle_transform.location
+    if len(vehicles) >= 2:
+        trailing_transform = vehicles[1].get_transform()
+        location = carla.Location(
+            x=(lead_transform.location.x + trailing_transform.location.x) * 0.5,
+            y=(lead_transform.location.y + trailing_transform.location.y) * 0.5,
+            z=(lead_transform.location.z + trailing_transform.location.z) * 0.5,
+        )
+        spacing = _distance_between(lead_transform.location, trailing_transform.location)
+        distance = max(distance, spacing * float(camera_config.get("distance_scale", 0.8)))
+        height = max(height, 4.0 + spacing * float(camera_config.get("height_scale", 0.08)))
+    else:
+        location = lead_transform.location
+
     spectator_location = carla.Location(
         x=location.x - forward.x * distance + up.x * height + right.x * lateral_offset,
         y=location.y - forward.y * distance + up.y * height + right.y * lateral_offset,
@@ -219,7 +379,7 @@ def _update_spectator(world, vehicle, camera_config):
     )
     spectator_rotation = carla.Rotation(
         pitch=pitch,
-        yaw=vehicle_transform.rotation.yaw,
+        yaw=yaw,
         roll=0.0,
     )
     world.get_spectator().set_transform(carla.Transform(spectator_location, spectator_rotation))
@@ -232,41 +392,317 @@ def _tick_for_seconds(world, duration_sec):
         world.tick()
 
 
-def _configure_vehicle_behavior(vehicle, traffic_manager, scenario_config):
-    behavior = scenario_config.get("behavior", {})
-    speed_diff = float(behavior.get("speed_percentage_difference", 0.0))
-    traffic_manager.vehicle_percentage_speed_difference(vehicle, speed_diff)
+def _configure_traffic_lights(world, scenario_config):
+    traffic_light_config = scenario_config.get("traffic_lights", {})
+    if not bool(traffic_light_config.get("force_green", False)):
+        return
+
+    for traffic_light in world.get_actors().filter("*traffic_light*"):
+        traffic_light.set_state(carla.TrafficLightState.Green)
+        traffic_light.freeze(True)
 
 
-def _evaluate_episode(vehicle, route_locations, next_route_index, state, timers, termination, dt):
-    location = vehicle.get_location()
+def _get_speed_mps(vehicle):
     velocity = vehicle.get_velocity()
-    speed_mps = math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z)
+    return math.sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z)
 
+
+def _select_profile_target_speed_mps(scenario_config):
+    speed_profile = scenario_config.get("speed_profile", {})
+    target_speeds = [float(value) for value in speed_profile.get("target_speeds_mps", [15.0, 17.5, 20.0])]
+    if not target_speeds:
+        raise ValueError("speed_profile.target_speeds_mps must not be empty.")
+    return random.choice(target_speeds)
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def _create_speed_profile_state(scenario_config, initial_speed_mps):
+    speed_profile = scenario_config.get("speed_profile", {})
+    target_speed_mps = _select_profile_target_speed_mps(scenario_config)
+    commanded_speed_mps = max(float(speed_profile.get("initial_speed_mps", initial_speed_mps)), initial_speed_mps)
+    return {
+        "phase": "accelerate",
+        "target_speed_mps": target_speed_mps,
+        "commanded_speed_mps": min(commanded_speed_mps, target_speed_mps),
+        "accel_mps2": float(speed_profile.get("accel_mps2", 2.0)),
+        "decel_mps2": float(speed_profile.get("decel_mps2", 3.5)),
+        "cruise_time_sec": float(speed_profile.get("cruise_time_sec", 7.0)),
+        "stop_speed_mps": float(speed_profile.get("stop_speed_mps", 0.4)),
+        "stop_hold_sec": float(speed_profile.get("stop_hold_sec", 1.0)),
+        "speed_tolerance_mps": float(speed_profile.get("speed_tolerance_mps", 0.6)),
+        "cruise_elapsed_sec": 0.0,
+        "stop_elapsed_sec": 0.0,
+        "profile_completed": False,
+    }
+
+
+def _create_follower_pid_state(scenario_config):
+    follower_control = scenario_config.get("follower_control", {})
+    return {
+        "h": float(follower_control.get("h", 1.0)),
+        "d0": float(follower_control.get("d0", 7.0)),
+        "kp": float(follower_control.get("kp", 0.4)),
+        "ki": float(follower_control.get("ki", 0.01)),
+        "kd": float(follower_control.get("kd", 0.1)),
+        "integral_error": 0.0,
+        "integral_limit": float(follower_control.get("integral_limit", 30.0)),
+        "emergency_distance_m": float(follower_control.get("emergency_distance_m", 5.0)),
+        "launch_speed_threshold_mps": float(follower_control.get("launch_speed_threshold_mps", 0.5)),
+        "launch_lead_speed_threshold_mps": float(follower_control.get("launch_lead_speed_threshold_mps", 1.0)),
+        "launch_spacing_error_threshold_m": float(follower_control.get("launch_spacing_error_threshold_m", 2.0)),
+        "launch_min_throttle": float(follower_control.get("launch_min_throttle", 0.2)),
+        "stop_speed_mps": float(follower_control.get("stop_speed_mps", 0.4)),
+        "stop_hold_sec": float(follower_control.get("stop_hold_sec", 1.0)),
+        "stop_elapsed_sec": 0.0,
+        "log_interval_ticks": max(1, int(follower_control.get("log_interval_ticks", 10))),
+    }
+
+
+def _update_speed_profile(vehicle, agent, profile_state, dt):
+    current_speed_mps = _get_speed_mps(vehicle)
+    phase = profile_state["phase"]
+
+    if phase == "accelerate":
+        profile_state["commanded_speed_mps"] = min(
+            profile_state["target_speed_mps"],
+            profile_state["commanded_speed_mps"] + profile_state["accel_mps2"] * dt,
+        )
+        if current_speed_mps >= profile_state["target_speed_mps"] - profile_state["speed_tolerance_mps"]:
+            profile_state["phase"] = "cruise"
+            profile_state["cruise_elapsed_sec"] = 0.0
+
+    elif phase == "cruise":
+        profile_state["commanded_speed_mps"] = profile_state["target_speed_mps"]
+        profile_state["cruise_elapsed_sec"] += dt
+        if profile_state["cruise_elapsed_sec"] >= profile_state["cruise_time_sec"]:
+            profile_state["phase"] = "decelerate"
+
+    elif phase == "decelerate":
+        profile_state["commanded_speed_mps"] = max(
+            0.0,
+            profile_state["commanded_speed_mps"] - profile_state["decel_mps2"] * dt,
+        )
+        if current_speed_mps <= profile_state["stop_speed_mps"]:
+            profile_state["stop_elapsed_sec"] += dt
+            if profile_state["stop_elapsed_sec"] >= profile_state["stop_hold_sec"]:
+                profile_state["phase"] = "stopped"
+                profile_state["profile_completed"] = True
+        else:
+            profile_state["stop_elapsed_sec"] = 0.0
+
+    agent.set_target_speed(profile_state["commanded_speed_mps"] * 3.6)
+
+
+def _apply_speed_profile_to_control(control, profile_state):
+    if profile_state["phase"] != "decelerate":
+        return control
+
+    if profile_state["commanded_speed_mps"] > 1.5:
+        return control
+
+    control.throttle = 0.0
+    control.brake = max(control.brake, 0.35)
+    return control
+
+
+def _build_basic_agent(vehicle, map_, scenario_config, route_locations, option_overrides=None):
+    if not route_locations:
+        raise ValueError("Scenario must define route_points and/or destination for BasicAgent.")
+
+    agent_config = scenario_config.get("basic_agent", {})
+    target_speed = float(agent_config.get("target_speed_kmh", 20.0))
+    option_keys = (
+        "ignore_traffic_lights",
+        "ignore_stop_signs",
+        "ignore_vehicles",
+        "use_bbs_detection",
+        "sampling_resolution",
+        "base_tlight_threshold",
+        "base_vehicle_threshold",
+        "detection_speed_ratio",
+        "max_brake",
+        "offset",
+    )
+    opt_dict = {
+        key: agent_config[key]
+        for key in option_keys
+        if key in agent_config
+    }
+    if option_overrides:
+        opt_dict.update(option_overrides)
+
+    agent = BasicAgent(vehicle, target_speed=target_speed, opt_dict=opt_dict, map_inst=map_)
+    if bool(agent_config.get("follow_speed_limits", False)):
+        agent.follow_speed_limits(True)
+
+    route_plan = []
+    start_location = vehicle.get_location()
+    for target_location in route_locations:
+        start_waypoint = map_.get_waypoint(start_location)
+        end_waypoint = map_.get_waypoint(target_location)
+        segment_plan = agent.trace_route(start_waypoint, end_waypoint)
+        if not segment_plan:
+            raise RuntimeError(
+                f"BasicAgent could not build a route segment to x={target_location.x:.2f}, y={target_location.y:.2f}."
+            )
+
+        if route_plan and segment_plan:
+            segment_plan = segment_plan[1:]
+        route_plan.extend(segment_plan)
+        start_location = target_location
+
+    agent.set_global_plan(route_plan)
+    return agent
+
+
+def _advance_route_progress(vehicle, route_locations, next_route_index, goal_tolerance):
     if route_locations and next_route_index < len(route_locations):
-        goal_tolerance = float(termination.get("goal_tolerance_m", 5.0))
-        if _distance_between(location, route_locations[next_route_index]) <= goal_tolerance:
+        if _distance_between(vehicle.get_location(), route_locations[next_route_index]) <= goal_tolerance:
             next_route_index += 1
-            if next_route_index >= len(route_locations):
-                return "route_completed", next_route_index
+    return next_route_index
 
-    if bool(termination.get("collision", True)) and state["collision"]:
-        return "collision", next_route_index
+
+def _compute_follower_control(leader_vehicle, follower_vehicle, follower_agent, follower_pid_state, dt):
+    lead_speed_mps = _get_speed_mps(leader_vehicle)
+    ego_speed_mps = _get_speed_mps(follower_vehicle)
+    distance_m = _distance_between(leader_vehicle.get_location(), follower_vehicle.get_location())
+    desired_distance_m = follower_pid_state["d0"] + follower_pid_state["h"] * ego_speed_mps
+    spacing_error_m = distance_m - desired_distance_m
+    relative_velocity_mps = lead_speed_mps - ego_speed_mps
+
+    follower_pid_state["integral_error"] = _clamp(
+        follower_pid_state["integral_error"] + spacing_error_m * dt,
+        -follower_pid_state["integral_limit"],
+        follower_pid_state["integral_limit"],
+    )
+
+    u = (
+        follower_pid_state["kp"] * spacing_error_m
+        + follower_pid_state["ki"] * follower_pid_state["integral_error"]
+        + follower_pid_state["kd"] * relative_velocity_mps
+    )
+
+    throttle = 0.0
+    brake = 0.0
+    if distance_m < follower_pid_state["emergency_distance_m"]:
+        brake = 1.0
+    elif u >= 0.0:
+        throttle = _clamp(u / 3.0, 0.0, 1.0)
+    else:
+        brake = _clamp((-u) / 4.0, 0.0, 1.0)
+
+    if (
+        ego_speed_mps <= follower_pid_state["launch_speed_threshold_mps"]
+        and lead_speed_mps >= follower_pid_state["launch_lead_speed_threshold_mps"]
+        and spacing_error_m >= follower_pid_state["launch_spacing_error_threshold_m"]
+    ):
+        throttle = max(throttle, follower_pid_state["launch_min_throttle"])
+        brake = 0.0
+
+    lateral_control = follower_agent.run_step()
+    control = carla.VehicleControl()
+    control.steer = lateral_control.steer
+    control.throttle = throttle
+    control.brake = brake
+    control.hand_brake = False
+    control.reverse = False
+    control.manual_gear_shift = False
+
+    if ego_speed_mps <= follower_pid_state["stop_speed_mps"]:
+        follower_pid_state["stop_elapsed_sec"] += dt
+    else:
+        follower_pid_state["stop_elapsed_sec"] = 0.0
+
+    metrics = {
+        "distance_m": distance_m,
+        "desired_distance_m": desired_distance_m,
+        "spacing_error_m": spacing_error_m,
+        "relative_velocity_mps": relative_velocity_mps,
+        "lead_speed_mps": lead_speed_mps,
+        "ego_speed_mps": ego_speed_mps,
+        "throttle": throttle,
+        "brake": brake,
+    }
+    return control, metrics
+
+
+def _log_follower_metrics(episode_count, tick_count, metrics):
+    logging.info(
+        (
+            "Episode %d follower tick %d: d=%.2f d_des=%.2f err=%.2f "
+            "rel_v=%.2f v_lead=%.2f v_follower=%.2f throttle=%.2f brake=%.2f"
+        ),
+        episode_count,
+        tick_count,
+        metrics["distance_m"],
+        metrics["desired_distance_m"],
+        metrics["spacing_error_m"],
+        metrics["relative_velocity_mps"],
+        metrics["lead_speed_mps"],
+        metrics["ego_speed_mps"],
+        metrics["throttle"],
+        metrics["brake"],
+    )
+
+
+def _evaluate_episode(
+    leader_vehicle,
+    follower_vehicle,
+    leader_profile_state,
+    follower_pid_state,
+    route_state,
+    collision_states,
+    timers,
+    termination,
+    dt,
+):
+    goal_tolerance = float(termination.get("goal_tolerance_m", 5.0))
+    route_state["leader_index"] = _advance_route_progress(
+        leader_vehicle,
+        route_state["leader_route_locations"],
+        route_state["leader_index"],
+        goal_tolerance,
+    )
+    route_state["follower_index"] = _advance_route_progress(
+        follower_vehicle,
+        route_state["follower_route_locations"],
+        route_state["follower_index"],
+        goal_tolerance,
+    )
+
+    if leader_profile_state["profile_completed"] and (
+        follower_pid_state["stop_elapsed_sec"] >= follower_pid_state["stop_hold_sec"]
+    ):
+        return "profile_completed"
+
+    if collision_states["leader"]["collision"]:
+        return "leader_collision"
+
+    if collision_states["follower"]["collision"]:
+        return "follower_collision"
+
+    speed_mps = _get_speed_mps(leader_vehicle)
+    if leader_profile_state["phase"] == "decelerate" and leader_profile_state["commanded_speed_mps"] <= 1.0:
+        timers["stuck_sec"] = 0.0
+        return None
 
     stuck_speed = float(termination.get("stuck_speed_mps", 0.5))
     stuck_time = float(termination.get("stuck_time_sec", 8.0))
     stuck_grace = float(termination.get("stuck_grace_sec", 0.0))
     if timers["elapsed_sec"] < stuck_grace:
-        return None, next_route_index
+        return None
 
     if speed_mps < stuck_speed:
         timers["stuck_sec"] += dt
         if timers["stuck_sec"] >= stuck_time:
-            return "stuck", next_route_index
+            return "leader_stuck"
     else:
         timers["stuck_sec"] = 0.0
 
-    return None, next_route_index
+    return None
 
 
 def _print_spawn_points(world):
@@ -316,15 +752,13 @@ def main(args):
             bool(scenario_config.get("allow_map_load", False)),
         )
         map_ = world.get_map()
+        _configure_traffic_lights(world, scenario_config)
 
         if args.print_spawn_points:
             _print_spawn_points(world)
             return
 
-        route_locations = [
-            _resolve_route_location(map_, point_config)
-            for point_config in scenario_config.get("ego", {}).get("route_points", [])
-        ]
+        stack_config, route_locations_by_actor = _align_scenario_to_map(stack_config, scenario_config, map_)
         max_time_sec = float(scenario_config.get("episode", {}).get("max_time_sec", 90.0))
         respawn_delay_sec = float(scenario_config.get("episode", {}).get("respawn_delay_sec", 2.0))
         dt = float(world.get_settings().fixed_delta_seconds or 0.05)
@@ -334,43 +768,98 @@ def main(args):
         while True:
             vehicles = []
             sensors = []
-            collision_sensor = None
-            collision_state = {"collision": False}
+            collision_states = {}
+            leader_agent = None
+            follower_agent = None
+            leader_profile_state = None
+            follower_pid_state = None
 
             try:
                 vehicles, sensors, objects = spawn_actors_from_config(world, stack_config)
-                vehicle = vehicles[0]
+                vehicles_by_id = {
+                    object_config["id"]: vehicle
+                    for vehicle, object_config in zip(vehicles, objects)
+                }
+                leader_vehicle = vehicles_by_id["leader"]
+                follower_vehicle = vehicles_by_id["follower"]
 
-                collision_sensor, collision_state = _attach_collision_sensor(world, vehicle)
-                sensors.append(collision_sensor)
+                for actor_id, vehicle in vehicles_by_id.items():
+                    collision_sensor, collision_state = _attach_collision_sensor(world, vehicle)
+                    sensors.append(collision_sensor)
+                    collision_states[actor_id] = collision_state
 
                 _ = world.tick()
 
-                autopilot_enabled = bool(objects[0].get("autopilot", False))
-                _set_vehicle_autopilot(vehicle, autopilot_enabled, traffic_manager)
-                _configure_vehicle_behavior(vehicle, traffic_manager, scenario_config)
                 _tick_for_seconds(world, float(scenario_config.get("episode", {}).get("settle_time_sec", 1.0)))
-                _update_spectator(world, vehicle, spectator_config)
+                leader_agent = _build_basic_agent(
+                    leader_vehicle,
+                    map_,
+                    scenario_config,
+                    route_locations_by_actor["leader"],
+                )
+                follower_agent = _build_basic_agent(
+                    follower_vehicle,
+                    map_,
+                    scenario_config,
+                    route_locations_by_actor["follower"],
+                    option_overrides={
+                        "ignore_traffic_lights": True,
+                        "ignore_stop_signs": True,
+                        "ignore_vehicles": True,
+                    },
+                )
+                leader_profile_state = _create_speed_profile_state(scenario_config, _get_speed_mps(leader_vehicle))
+                follower_pid_state = _create_follower_pid_state(scenario_config)
+                _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
 
                 episode_count += 1
-                logging.info("Episode %d started", episode_count)
+                logging.info(
+                    "Episode %d started (leader target speed %.1f m/s)",
+                    episode_count,
+                    leader_profile_state["target_speed_mps"],
+                )
 
                 elapsed_sec = 0.0
-                next_route_index = 0
+                tick_count = 0
+                route_state = {
+                    "leader_index": 0,
+                    "follower_index": 0,
+                    "leader_route_locations": route_locations_by_actor["leader"],
+                    "follower_route_locations": route_locations_by_actor["follower"],
+                }
                 timers = {"stuck_sec": 0.0, "elapsed_sec": 0.0}
                 termination = scenario_config.get("termination", {})
 
                 while True:
                     _ = world.tick()
                     elapsed_sec += dt
+                    tick_count += 1
                     timers["elapsed_sec"] = elapsed_sec
-                    _update_spectator(world, vehicle, spectator_config)
+                    _update_speed_profile(leader_vehicle, leader_agent, leader_profile_state, dt)
+                    leader_control = leader_agent.run_step()
+                    leader_control = _apply_speed_profile_to_control(leader_control, leader_profile_state)
+                    leader_vehicle.apply_control(leader_control)
 
-                    reason, next_route_index = _evaluate_episode(
-                        vehicle,
-                        route_locations,
-                        next_route_index,
-                        collision_state,
+                    follower_control, follower_metrics = _compute_follower_control(
+                        leader_vehicle,
+                        follower_vehicle,
+                        follower_agent,
+                        follower_pid_state,
+                        dt,
+                    )
+                    follower_vehicle.apply_control(follower_control)
+                    if tick_count % follower_pid_state["log_interval_ticks"] == 0:
+                        _log_follower_metrics(episode_count, tick_count, follower_metrics)
+
+                    _update_spectator(world, [leader_vehicle, follower_vehicle], spectator_config)
+
+                    reason = _evaluate_episode(
+                        leader_vehicle,
+                        follower_vehicle,
+                        leader_profile_state,
+                        follower_pid_state,
+                        route_state,
+                        collision_states,
                         timers,
                         termination,
                         dt,

@@ -79,6 +79,88 @@ def _resolve_vehicle_spawn_point(map_, config):
     return spawn_points[spawn_index]
 
 
+def _candidate_spawn_points(map_, spawn_point):
+    candidates = [spawn_point]
+    waypoint = map_.get_waypoint(
+        spawn_point.location,
+        project_to_road=True,
+        lane_type=carla.LaneType.Driving,
+    )
+    if waypoint is None:
+        return candidates
+
+    offsets_m = (2.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0)
+    seen = {
+        (
+            round(spawn_point.location.x, 2),
+            round(spawn_point.location.y, 2),
+            round(spawn_point.location.z, 2),
+            round(spawn_point.rotation.yaw, 2),
+        )
+    }
+
+    for offset in offsets_m:
+        for next_wp in waypoint.next(offset):
+            transform = carla.Transform(next_wp.transform.location, spawn_point.rotation)
+            transform.location.z += 0.05
+            key = (
+                round(transform.location.x, 2),
+                round(transform.location.y, 2),
+                round(transform.location.z, 2),
+                round(transform.rotation.yaw, 2),
+            )
+            if key not in seen:
+                seen.add(key)
+                candidates.append(transform)
+
+        for prev_wp in waypoint.previous(offset):
+            transform = carla.Transform(prev_wp.transform.location, spawn_point.rotation)
+            transform.location.z += 0.05
+            key = (
+                round(transform.location.x, 2),
+                round(transform.location.y, 2),
+                round(transform.location.z, 2),
+                round(transform.rotation.yaw, 2),
+            )
+            if key not in seen:
+                seen.add(key)
+                candidates.append(transform)
+
+    spawn_points = sorted(
+        map_.get_spawn_points(),
+        key=lambda transform: transform.location.distance(spawn_point.location),
+    )
+    for fallback_spawn_point in spawn_points[:10]:
+        transform = carla.Transform(fallback_spawn_point.location, spawn_point.rotation)
+        transform.location.z = fallback_spawn_point.location.z + 0.05
+        key = (
+            round(transform.location.x, 2),
+            round(transform.location.y, 2),
+            round(transform.location.z, 2),
+            round(transform.rotation.yaw, 2),
+        )
+        if key not in seen:
+            seen.add(key)
+            candidates.append(transform)
+
+    return candidates
+
+
+def _destroy_existing_vehicle_with_role_name(world, role_name):
+    for vehicle in world.get_actors().filter("vehicle.*"):
+        if vehicle.attributes.get("role_name") == role_name:
+            vehicle.destroy()
+
+
+def _clear_vehicles_near_spawn(world, location, radius_m):
+    if radius_m <= 0:
+        return
+
+    for vehicle in world.get_actors().filter("vehicle.*"):
+        if vehicle.get_transform().location.distance(location) <= radius_m:
+            vehicle.destroy()
+
+
 def _setup_vehicle(world, config):
     vehicle_type = config.get("type")
     vehicle_id = config.get("id")
@@ -95,12 +177,21 @@ def _setup_vehicle(world, config):
     bp.set_attribute("role_name", vehicle_id)
     bp.set_attribute("ros_name", vehicle_id)
 
+    _destroy_existing_vehicle_with_role_name(world, vehicle_id)
+
     spawn_point = _resolve_vehicle_spawn_point(map_, config)
-    vehicle = world.try_spawn_actor(bp, spawn_point)
+    clear_radius_m = float(config.get("clear_spawn_radius_m", 12.0))
+    _clear_vehicles_near_spawn(world, spawn_point.location, clear_radius_m)
+    vehicle = None
+    for candidate_spawn_point in _candidate_spawn_points(map_, spawn_point):
+        vehicle = world.try_spawn_actor(bp, candidate_spawn_point)
+        if vehicle is not None:
+            break
+
     if vehicle is None:
         raise RuntimeError(
             f'Failed to spawn vehicle "{vehicle_id}". '
-            "The spawn point may be blocked by another actor."
+            "The spawn point and nearby lane positions may be blocked by another actor."
         )
 
     return vehicle
